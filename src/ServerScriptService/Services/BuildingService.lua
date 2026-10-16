@@ -1,293 +1,171 @@
---[[]]
-BuildingService - Gerencia compra e colocação de construções
-Melhorias:
-- Ao colocar um Habitat, tenta reatribuir dragões arquivados automaticamente.
-- Ao colocar um Incubator, registra visualizador e spawna ovos presentes.
-- Ao guardar (store) uma construção Habitat, arquiva dragões que estavam naquele habitat.
-- Ao guardar Incubator, remove visuais dos ovos.
---]]
+--[[
+    DataService (ModuleScript)
+    Local no Studio: ServerScriptService > Services > DataService
+    Carrega/salva o perfil do jogador (DataStore) e envia atualizações ao cliente.
+]]
 
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 
 local Config = require(ReplicatedStorage.Shared.Config)
-local Data = require(script.Parent.DataService)
-local PlotService = require(script.Parent.PlotService)
-local HabitatManager = require(script.Parent.Parent.Modules.HabitatManager)
-local FloatingBase = require(script.Parent.Parent.Modules.FloatingBase)
-local okIncViz, IncubatorVisualizer = pcall(require, script.Parent.Parent.Modules.IncubatorVisualizer)
-if not okIncViz then IncubatorVisualizer = nil end
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
 
-local BuildingService = {}
-BuildingService.Handlers = {}
+local store = DataStoreService:GetDataStore("DragonMVP_v1")
 
--- Gera ID único para building
-local function generateId(profile)
-    local id = "B_" .. profile.NextId
-    profile.NextId = profile.NextId + 1
-    return id
-end
+local DataService = {}
+local profiles = {}
+local noSave = {}
 
--- Compra construção e adiciona ao inventário
-BuildingService.Handlers.BuyBuilding = function(player, buildingType, element)
-    local profile = Data.Get(player)
-    if not profile then return false, "Perfil não carregado" end
+DataService.OnProfileLoaded = nil
 
-    local buildingConfig = Config.Buildings[buildingType]
-    if not buildingConfig then return false, "Tipo de construção inválido" end
-
-    local cost = buildingConfig.Cost or buildingConfig.BaseCost
-    if profile.Gold < cost then
-        return false, "Ouro insuficiente"
-    end
-
-    -- Para Habitats, precisa especificar elemento
-    if buildingType == "Habitat" and not element then
-        return false, "Elemento não especificado"
-    end
-    if buildingType == "Habitat" and not table.find(Config.Elements, element) then
-        return false, "Elemento inválido"
-    end
-
-    -- Deduz ouro
-    profile.Gold = profile.Gold - cost
-
-    -- Cria building data
-    local buildingId = generateId(profile)
-    local buildingData = {
-        Id = buildingId,
-        Type = buildingType,
-        Element = element, -- nil para Farm/Incubator
-        Level = 1,
-        PurchasedAt = os.time(),
+local function newProfile()
+    return {
+        Gold = Config.StartGold,
+        Apples = Config.StartApples,
+        Dragons = {},
+        Eggs = {},
+        Team = {},
+        FarmLevel = 1,
+        HabitatSlots = Config.HabitatBaseSlots,
+        LastGoldCollect = os.time(),
+        LastHarvest = os.time(),
+        NextId = 1,
+        Receipts = {},
+        Stats = { Wins = 0, Heists = 0, EggsStolen = 0 },
+        PlotId = nil,
+        Buildings = {
+            Inventory = {},
+            Placed = {},
+        },
+        IncubatorSlots = Config.IncubatorSlots,
+        FirstTime = true,
     }
-
-    -- Adiciona ao inventário
-    profile.Buildings.Inventory[buildingId] = buildingData
-
-    Data.Push(player)
-    return true, buildingData
 end
 
--- Coloca construção no plot
-BuildingService.Handlers.PlaceBuilding = function(player, buildingId, position, rotation)
-    local profile = Data.Get(player)
-    if not profile then return false, "Perfil não carregado" end
+local function reconcile(data, template)
+    for k, v in pairs(template) do
+        if data[k] == nil then
+            data[k] = type(v) == "table" and table.clone(v) or v
+        end
+    end
+end
 
-    -- Valida que building existe no inventário
-    local buildingData = profile.Buildings.Inventory[buildingId]
-    if not buildingData then
-        return false, "Construção não encontrada no inventário"
+local function loadProfile(player)
+    local key = "P_" .. player.UserId
+    local data, ok, err
+    for attempt = 1, 3 do
+        ok, err = pcall(function()
+            data = store:GetAsync(key)
+        end)
+        if ok then
+            break
+        end
+        task.wait(attempt)
+    end
+    if not player.Parent then
+        return
     end
 
-    print("[BuildingService] PlaceBuilding: " .. buildingId .. " em " .. tostring(position))
-
-    -- Valida posição dentro do plot
-    if not PlotService.IsInPlot(player, position) then
-        return false, "Fora dos limites do plot"
-    end
-
-    -- TODO: validar colisão (por enquanto aceita tudo)
-
-    -- Move de Inventory para Placed
-    profile.Buildings.Inventory[buildingId] = nil
-    buildingData.Position = {position.X, position.Y, position.Z}
-    buildingData.Rotation = rotation or 0
-    profile.Buildings.Placed[buildingId] = buildingData
-
-    print("[BuildingService] Building salvo em Placed")
-
-    -- Instanciar físicamente
-    BuildingService.InstantiateBuilding(player, buildingData)
-
-    -- Se for Habitat, tentar reatribuir dragões arquivados
-    if buildingData.Type == "Habitat" then
-        local assigned = HabitatManager.ReassignArchivedDragons(profile, buildingId, player)
-        if assigned and assigned > 0 then
-            print("[BuildingService] Reatribuiu " .. assigned .. " dragões arquivados para habitat " .. buildingId)
+    if not ok then
+        warn("[DataService] Falha ao carregar " .. player.Name .. ": " .. tostring(err))
+        if RunService:IsStudio() then
+            noSave[player] = true
+        else
+            player:Kick("Não foi possível carregar seus dados. Tente entrar de novo.")
+            return
         end
     end
 
-    Data.Push(player)
-    return true
+    local template = newProfile()
+    if type(data) ~= "table" then
+        data = template
+    else
+        reconcile(data, template)
+    end
+
+    if data.HabitatSlots == nil then
+        data.HabitatSlots = Config.HabitatBaseSlots
+    end
+
+    profiles[player] = data
+    DataService.Push(player)
+
+    if DataService.OnProfileLoaded then
+        DataService.OnProfileLoaded(player, data)
+    end
 end
 
--- Move construção para nova posição
-BuildingService.Handlers.MoveBuilding = function(player, buildingId, position, rotation)
-    local profile = Data.Get(player)
-    if not profile then return false, "Perfil não carregado" end
-
-    local buildingData = profile.Buildings.Placed[buildingId]
-    if not buildingData then
-        return false, "Construção não encontrada"
-    end
-
-    if not PlotService.IsInPlot(player, position) then
-        return false, "Fora dos limites do plot"
-    end
-
-    -- Atualiza posição
-    buildingData.Position = {position.X, position.Y, position.Z}
-    buildingData.Rotation = rotation or buildingData.Rotation
-
-    -- Atualiza físico
-    local plotData = PlotService.GetPlot(player)
-    if plotData then
-        local existing = plotData.Folder:FindFirstChild("Building_" .. buildingId)
-        if existing then
-            local pos = Vector3.new(unpack(buildingData.Position))
-            existing:SetPrimaryPartCFrame(CFrame.new(pos) * CFrame.Angles(0, math.rad(buildingData.Rotation), 0))
-        end
-    end
-
-    Data.Push(player)
-    return true
+function DataService.Get(player)
+    return profiles[player]
 end
 
--- Guarda construção de volta no inventário
-BuildingService.Handlers.StoreBuilding = function(player, buildingId)
-    local profile = Data.Get(player)
-    if not profile then return false, "Perfil não carregado" end
+function DataService.WaitForProfile(player, timeout)
+    local t = 0
+    while not profiles[player] and player.Parent and t < (timeout or 20) do
+        t += task.wait(0.2)
+    end
+    return profiles[player]
+end
 
-    local buildingData = profile.Buildings.Placed[buildingId]
-    if not buildingData then
-        return false, "Construção não encontrada"
+function DataService.Push(player)
+    local p = profiles[player]
+    if p and player.Parent then
+        Remotes.ProfileChanged:FireClient(player, p)
+    end
+end
+
+function DataService.Save(player)
+    local p = profiles[player]
+    if not p or noSave[player] then
+        return false
+    end
+    local ok, err = pcall(function()
+        store:SetAsync("P_" .. player.UserId, p)
+    end)
+    if not ok then
+        warn("[DataService] Falha ao salvar " .. player.Name .. ": " .. tostring(err))
+    end
+    return ok
+end
+
+function DataService.Init()
+    Players.PlayerAdded:Connect(function(player)
+        task.spawn(loadProfile, player)
+    end)
+    for _, player in ipairs(Players:GetPlayers()) do
+        task.spawn(loadProfile, player)
     end
 
-    -- Se for Habitat, arquiva dragões que estavam naquele habitat
-    if buildingData.Type == "Habitat" then
-        for dragonId, dragon in pairs(profile.Dragons) do
-            if dragon.HabitatId == buildingId then
-                dragon.Archived = true
-                dragon.HabitatId = nil
-                -- Remove do time se estiver
-                local tIdx = table.find(profile.Team, dragonId)
-                if tIdx then table.remove(profile.Team, tIdx) end
-                -- Remove modelo 3D do mundo
-                local ok, DragonSpawner = pcall(require, script.Parent.Parent.Modules.DragonSpawner)
-                if ok and DragonSpawner then
-                    pcall(function() DragonSpawner.RemoveDragon(dragonId) end)
-                end
+    Players.PlayerRemoving:Connect(function(player)
+        DataService.Save(player)
+        profiles[player] = nil
+        noSave[player] = nil
+    end)
+
+    task.spawn(function()
+        while true do
+            task.wait(120)
+            for _, player in ipairs(Players:GetPlayers()) do
+                task.spawn(DataService.Save, player)
             end
         end
-    end
+    end)
 
-    -- If Incubator, unregister visuals
-    if buildingData.Type == "Incubator" and IncubatorVisualizer then
-        pcall(function() IncubatorVisualizer.UnregisterIncubator(buildingId) end)
-    end
-
-    -- Move para inventário
-    profile.Buildings.Placed[buildingId] = nil
-    buildingData.Position = nil
-    buildingData.Rotation = nil
-    profile.Buildings.Inventory[buildingId] = buildingData
-
-    -- Remove físico
-    local plotData = PlotService.GetPlot(player)
-    if plotData then
-        local existing = plotData.Folder:FindFirstChild("Building_" .. buildingId)
-        if existing then
-            -- Unregister from floating base if needed
-            pcall(function()
-                FloatingBase.Unregister(existing)
+    game:BindToClose(function()
+        local pending = 0
+        for _, player in ipairs(Players:GetPlayers()) do
+            pending += 1
+            task.spawn(function()
+                DataService.Save(player)
+                pending -= 1
             end)
-            existing:Destroy()
         end
-    end
-
-    Data.Push(player)
-    return true
+        while pending > 0 do
+            task.wait()
+        end
+    end)
 end
 
--- Instancia construção no mundo (modelo simples por enquanto)
-function BuildingService.InstantiateBuilding(player, buildingData)
-    local plotData = PlotService.GetPlot(player)
-    if not plotData then
-        warn("[BuildingService] Plot não encontrado para " .. player.Name)
-        return
-    end
-
-    local buildingConfig = Config.Buildings[buildingData.Type]
-    if not buildingConfig then
-        warn("[BuildingService] Config não encontrada para " .. buildingData.Type)
-        return
-    end
-
-    local position = Vector3.new(unpack(buildingData.Position))
-    local size = buildingConfig.Size
-
-    print("[BuildingService] Instanciando " .. buildingData.Type .. " em " .. tostring(position))
-
-    -- Cria modelo simples (um Part por enquanto)
-    local model = Instance.new("Model")
-    model.Name = "Building_" .. buildingData.Id
-
-    local part = Instance.new("Part")
-    part.Name = "Base"
-    part.Size = size
-    -- Posição: recebemos a base (Y do chão), então adicionamos metade da altura
-    part.Position = position + Vector3.new(0, size.Y/2, 0)
-    part.Anchored = true
-    part.Material = Enum.Material.Wood
-    part.CanCollide = true
-
-    -- Cor por tipo
-    if buildingData.Type == "Farm" then
-        part.BrickColor = BrickColor.new("Bright yellow")
-    elseif buildingData.Type == "Incubator" then
-        part.BrickColor = BrickColor.new("Light stone grey")
-    elseif buildingData.Type == "Habitat" then
-        local elementColor = Config.ElementColors[buildingData.Element]
-        part.Color = elementColor or Color3.new(1, 1, 1)
-    end
-
-    part.Parent = model
-    model.PrimaryPart = part
-
-    -- Rotação
-    local rotation = buildingData.Rotation or 0
-    model:SetPrimaryPartCFrame(CFrame.new(part.Position) * CFrame.Angles(0, math.rad(rotation), 0))
-
-    -- Tag para identificar
-    local tag = Instance.new("StringValue")
-    tag.Name = "BuildingId"
-    tag.Value = buildingData.Id
-    tag.Parent = model
-
-    model.Parent = plotData.Folder
-
-    -- Se Habitat: registrar flutuação e tornar maior visualmente
-    if buildingData.Type == "Habitat" then
-        pcall(function()
-            FloatingBase.Register(model, 3, 0.9)
-        end)
-    end
-
-    -- If Incubator: register visualizer and spawn existing eggs for the owner
-    if buildingData.Type == "Incubator" and IncubatorVisualizer then
-        pcall(function()
-            IncubatorVisualizer.RegisterIncubator(model, player, buildingData.Id)
-            local profile = Data.Get(player)
-            if profile and profile.Eggs then
-                for _, egg in ipairs(profile.Eggs) do
-                    pcall(function() IncubatorVisualizer.SpawnEgg(player, egg) end)
-                end
-            end
-        end)
-    end
-
-    print("[BuildingService] Building instanciado: " .. model.Name)
-end
-
--- Carregar construções colocadas ao entrar
-function BuildingService.LoadPlacedBuildings(player)
-    local profile = Data.Get(player)
-    if not profile then return end
-
-    for buildingId, buildingData in pairs(profile.Buildings.Placed) do
-        BuildingService.InstantiateBuilding(player, buildingData)
-    end
-end
-
-return BuildingService
+return DataService

@@ -1,272 +1,153 @@
---[[]]
-IncubatorService (ModuleScript) - updated to notify IncubatorVisualizer about eggs
---]]
+--[[
+BuildingService - Gerencia compra, colocação e gestão de construções.
+]]
 
-local MarketplaceService = game:GetService("MarketplaceService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
 
 local Config = require(ReplicatedStorage.Shared.Config)
-local DragonUtil = require(ReplicatedStorage.Shared.DragonUtil)
 local Data = require(script.Parent.DataService)
-local Dragon = require(script.Parent.DragonService)
+local PlotService = require(script.Parent.PlotService)
 local HabitatManager = require(script.Parent.Parent.Modules.HabitatManager)
-local okViz, IncubatorVisualizer = pcall(require, script.Parent.Parent.Modules.IncubatorVisualizer)
-if not okViz then
+local FloatingBase = require(script.Parent.Parent.Modules.FloatingBase)
+
+local okIncViz, IncubatorVisualizer = pcall(require, script.Parent.Parent.Modules.IncubatorVisualizer)
+if not okIncViz then
     IncubatorVisualizer = nil
 end
 
-local IncubatorService = {}
-IncubatorService.Handlers = {}
+local BuildingService = {}
+BuildingService.Handlers = {}
 
-local pendingSkip = {} -- [userId] = eggId aguardando compra
-
-----------------------------------------------------------------------
--- API usada por outros serviços
-----------------------------------------------------------------------
-function IncubatorService.AddEgg(player, egg, force)
-    local profile = Data.Get(player)
-    if not force and not HabitatManager.CanAddEgg(profile) then
-        return false, "Incubadora cheia"
-    end
-    egg.Id = "e" .. profile.NextId
-    profile.NextId += 1
-    table.insert(profile.Eggs, egg)
-
-    -- Visual: spawn egg in incubator if placed
-    if IncubatorVisualizer then
-        pcall(function() IncubatorVisualizer.SpawnEgg(player, egg) end)
-    end
-
-    return true, egg
+local function generateId(profile)
+    local id = "B_" .. profile.NextId
+    profile.NextId = profile.NextId + 1
+    return id
 end
 
--- Ovo roubado na expedição. Tier 1..3 (pequeno, grande, gigante)
-function IncubatorService.CreateHeistEgg(tier)
-    local t = Config.Heist.Tiers[tier]
-    local weights = {}
-    for _, e in ipairs(Config.BasicEggElements) do
-        weights[e] = 10
+local function ensureHabitatSlots(profile)
+    if profile.HabitatSlots == nil then
+        profile.HabitatSlots = Config.HabitatBaseSlots
     end
-    weights.Infernal = 2 * tier
-    weights.Cosmico = 0.5 * tier * tier -- 0.5 / 2 / 4.5
+end
 
-    local element = DragonUtil.WeightedPick(Config.Elements, function(e)
-        return weights[e] or 0
-    end)
-    return {
+BuildingService.Handlers.BuyBuilding = function(player, buildingType, element)
+    local profile = Data.Get(player)
+    if not profile then return false, "Perfil não carregado" end
+
+    ensureHabitatSlots(profile)
+
+    local buildingConfig = Config.Buildings[buildingType]
+    if not buildingConfig then return false, "Tipo de construção inválido" end
+
+    local cost = buildingConfig.Cost or buildingConfig.BaseCost
+    if profile.Gold < cost then
+        return false, "Ouro insuficiente"
+    end
+
+    if buildingType == "Habitat" and not element then
+        return false, "Elemento não especificado"
+    end
+    if buildingType == "Habitat" and not table.find(Config.Elements, element) then
+        return false, "Elemento inválido"
+    end
+
+    profile.Gold = profile.Gold - cost
+
+    local buildingId = generateId(profile)
+    local buildingData = {
+        Id = buildingId,
+        Type = buildingType,
         Element = element,
-        Rarity = Dragon.RollRarity(t.RarityBonus),
-        Shiny = Dragon.RollShiny(t.ShinyChance),
-        ReadyAt = os.time() + t.HatchSeconds,
-        Source = "Expedição",
+        Level = 1,
+        PurchasedAt = os.time(),
     }
+
+    profile.Buildings.Inventory[buildingId] = buildingData
+    Data.Push(player)
+    return true, buildingData
 end
 
-----------------------------------------------------------------------
--- Cruzamento
-----------------------------------------------------------------------
-local function resolveElement(ea, eb)
-    for _, r in ipairs(Config.Recipes) do
-        if (r.A == ea and r.B == eb) or (r.A == eb and r.B == ea) then
-            if math.random() < r.Chance then
-                return r.Result
+BuildingService.Handlers.PlaceBuilding = function(player, buildingId, position, rotation)
+    local profile = Data.Get(player)
+    if not profile then return false, "Perfil não carregado" end
+
+    local buildingData = profile.Buildings.Inventory[buildingId]
+    if not buildingData then return false, "Construção não encontrada no inventário" end
+
+    if not PlotService.IsInPlot(player, position) then
+        return false, "Fora dos limites do plot"
+    end
+
+    buildingData.Position = position
+    buildingData.Rotation = rotation or 0
+    profile.Buildings.Placed[buildingId] = buildingData
+    profile.Buildings.Inventory[buildingId] = nil
+
+    if buildingData.Type == "Habitat" then
+        local dragonList = {}
+        for _, dragon in pairs(profile.Dragons) do
+            if dragon.Archived and dragon.HabitatId == nil then
+                table.insert(dragonList, dragon)
+            end
+        end
+
+        local count = 0
+        for _, dragon in pairs(dragonList) do
+            if count >= Config.MaxDragonsPerHabitat then break end
+            if dragon and dragon.Element == buildingData.Element then
+                dragon.HabitatId = buildingId
+                dragon.Archived = false
+                count += 1
             end
         end
     end
-    return math.random() < 0.5 and ea or eb
-end
 
-local function resolveRarity(a, b)
-    local ia, ib = Config.RarityIndex[a.Rarity], Config.RarityIndex[b.Rarity]
-    local idx = math.random(math.min(ia, ib), math.max(ia, ib))
-    if math.random() < 0.2 then
-        idx = math.min(idx + 1, #Config.Rarities)
-    end
-    return Config.Rarities[idx].Name
-end
-
-----------------------------------------------------------------------
--- Handlers
-----------------------------------------------------------------------
-function IncubatorService.Handlers.BuyEgg(player)
-    local profile = Data.Get(player)
-    if #profile.Eggs >= Config.IncubatorSlots then
-        return false, "Incubadora cheia."
-    end
-    if profile.Gold < Config.BasicEggCost then
-        return false, "Ouro insuficiente (" .. Config.BasicEggCost .. ")."
-    end
-    profile.Gold -= Config.BasicEggCost
-    local ok, egg = IncubatorService.AddEgg(player, {
-        Element = Config.BasicEggElements[math.random(#Config.BasicEggElements)],
-        Rarity = Dragon.RollRarity(0, 3), -- ovo básico não dá Lendário/Mítico
-        Shiny = Dragon.RollShiny(),
-        ReadyAt = os.time() + Config.BasicEggHatchSeconds,
-        Source = "Loja",
-    })
     Data.Push(player)
     return true
 end
 
-function IncubatorService.Handlers.Breed(player, idA, idB)
+function BuildingService.LoadPlacedBuildings(player)
     local profile = Data.Get(player)
-    if type(idA) ~= "string" or type(idB) ~= "string" or idA == idB then
-        return false, "Escolha dois dragões diferentes."
+    if not profile then return end
+    for _, building in pairs(profile.Buildings.Placed) do
+        if building.Type == "Incubator" and IncubatorVisualizer then
+            pcall(function()
+                IncubatorVisualizer.RegisterIncubator(building.Model, player, building.Id)
+            end)
+        end
     end
-    local a, b = profile.Dragons[idA], profile.Dragons[idB]
-    if not a or not b then
-        return false, "Dragão inválido."
-    end
-    if a.Level < Config.MinBreedLevel or b.Level < Config.MinBreedLevel then
-        return false, "Os pais precisam ser nível " .. Config.MinBreedLevel .. "+."
-    end
-    if #profile.Eggs >= Config.IncubatorSlots then
-        return false, "Incubadora cheia."
-    end
-    if profile.Gold < Config.BreedCost then
-        return false, "Ouro insuficiente (" .. Config.BreedCost .. ")."
+end
+
+function BuildingService.StoreBuilding(player, buildingId)
+    local profile = Data.Get(player)
+    if not profile then return false end
+
+    local building = profile.Buildings.Placed[buildingId]
+    if not building then return false end
+
+    if building.Type == "Habitat" then
+        for _, dragon in pairs(profile.Dragons) do
+            if dragon.HabitatId == buildingId and not dragon.Archived then
+                dragon.Archived = true
+                dragon.HabitatId = nil
+            end
+        end
+    elseif building.Type == "Incubator" and IncubatorVisualizer then
+        IncubatorVisualizer.UnregisterIncubator(buildingId)
     end
 
-    profile.Gold -= Config.BreedCost
-    local shinyChance = (a.Shiny or b.Shiny) and 0.10 or 0.03
-    IncubatorService.AddEgg(player, {
-        Element = resolveElement(a.Element, b.Element),
-        Rarity = resolveRarity(a, b),
-        Shiny = Dragon.RollShiny(shinyChance),
-        ReadyAt = os.time() + Config.BreedHatchSeconds,
-        Source = "Cruzamento",
-    })
+    profile.Buildings.Inventory[buildingId] = {
+        Id = building.Id,
+        Type = building.Type,
+        Element = building.Element,
+        Level = building.Level,
+        PurchasedAt = building.PurchasedAt,
+    }
+    profile.Buildings.Placed[buildingId] = nil
+
     Data.Push(player)
     return true
 end
 
-function IncubatorService.Handlers.Hatch(player, eggId, action)
-    local profile = Data.Get(player)
-    for i, egg in ipairs(profile.Eggs) do
-        if egg.Id == eggId then
-            if os.time() < egg.ReadyAt then
-                return false, "O ovo ainda está chocando."
-            end
-
-            -- Verifica se tem habitat disponível
-            local hasHabitat = HabitatManager.CanHatchEgg(profile, egg.Element)
-
-            if not hasHabitat then
-                -- Sem habitat: precisa escolher arquivar ou vender
-                if not action then
-                    -- Retorna sinal especial: precisa escolher
-                    return false, "NO_HABITAT", {
-                        element = egg.Element,
-                        rarity = egg.Rarity,
-                        shiny = egg.Shiny,
-                    }
-                end
-
-                if action == "Archive" then
-                    -- Choca e arquiva
-                    table.remove(profile.Eggs, i)
-                    local d = Dragon.Add(player, Dragon.New(egg.Element, egg.Rarity, egg.Shiny))
-                    d.Archived = true
-                    d.HabitatId = nil
-
-                    -- Remove visual egg
-                    if IncubatorVisualizer then pcall(function() IncubatorVisualizer.RemoveEgg(egg.Id) end) end
-
-                    Data.Push(player)
-                    return true, d
-
-                elseif action == "Sell" then
-                    -- Choca e vende imediatamente
-                    table.remove(profile.Eggs, i)
-                    local baseValue = Config.DragonSellValue[egg.Rarity] or 50
-                    local value = baseValue * (egg.Shiny and 2 or 1)
-                    profile.Gold += value
-
-                    -- Remove visual egg
-                    if IncubatorVisualizer then pcall(function() IncubatorVisualizer.RemoveEgg(egg.Id) end) end
-
-                    Data.Push(player)
-                    return true, { sold = true, value = value }
-
-                else
-                    return false, "Ação inválida. Use 'Archive' ou 'Sell'."
-                end
-            end
-
-            -- Tem habitat: choca normalmente
-            table.remove(profile.Eggs, i)
-            local d = Dragon.Add(player, Dragon.New(egg.Element, egg.Rarity, egg.Shiny))
-
-            -- Remove visual egg
-            if IncubatorVisualizer then pcall(function() IncubatorVisualizer.RemoveEgg(egg.Id) end) end
-
-            -- Spawna dragão no mundo
-            local ok, DragonSpawner = pcall(require, script.Parent.Parent.Modules.DragonSpawner)
-            if ok and DragonSpawner then
-                DragonSpawner.SpawnDragon(player, d, profile)
-            end
-
-            Data.Push(player)
-            return true, d
-        end
-    end
-    return false, "Ovo não encontrado."
-end
-
-function IncubatorService.Handlers.SkipEgg(player, eggId)
-    local profile = Data.Get(player)
-    local found
-    for _, egg in ipairs(profile.Eggs) do
-        if egg.Id == eggId then
-            found = egg
-        end
-    end
-    if not found then
-        return false, "Ovo não encontrado."
-    end
-
-    if Config.SkipProductId == 0 then
-        if RunService:IsStudio() then
-            found.ReadyAt = os.time() -- só para testes
-            -- Mark visual as ready
-            if IncubatorVisualizer then pcall(function() IncubatorVisualizer.MarkEggReady(found.Id) end) end
-            Data.Push(player)
-            return true
-        end
-        return false, "Produto de Robux não configurado."
-    end
-
-    pendingSkip[player.UserId] = eggId
-    MarketplaceService:PromptProductPurchase(player, Config.SkipProductId)
-    return true
-end
-
--- Chamado pelo MarketplaceService.ProcessReceipt (ver Main). Retorna true se concedeu.
-function IncubatorService.ProcessReceipt(player, receiptInfo)
-    local profile = Data.Get(player)
-    if not profile then
-        return false
-    end
-    local receiptId = tostring(receiptInfo.PurchaseId)
-    if profile.Receipts[receiptId] then
-        return true -- já concedido
-    end
-    if receiptInfo.ProductId ~= Config.SkipProductId then
-        return false
-    end
-
-    local eggId = pendingSkip[player.UserId]
-    pendingSkip[player.UserId] = nil
-    for _, egg in ipairs(profile.Eggs) do
-        if egg.Id == eggId then
-            egg.ReadyAt = os.time()
-            if IncubatorVisualizer then pcall(function() IncubatorVisualizer.MarkEggReady(egg.Id) end) end
-        end
-    end
-    profile.Receipts[receiptId] = true
-    Data.Push(player)
-    return Data.Save(player) -- só confirma a compra se salvou
-end
-
-return IncubatorService
+return BuildingService
