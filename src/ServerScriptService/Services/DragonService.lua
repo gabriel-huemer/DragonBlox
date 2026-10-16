@@ -1,4 +1,4 @@
---[[]]
+--[[
 DragonService (ModuleScript)
 Responsabilidades expandidas:
 - Garantir invariantes: não existir dragão ativo sem habitat.
