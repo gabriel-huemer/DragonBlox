@@ -2,8 +2,9 @@
 BuildingService - Gerencia compra e colocação de construções
 Melhorias:
 - Ao colocar um Habitat, tenta reatribuir dragões arquivados automaticamente.
+- Ao colocar um Incubator, registra visualizador e spawna ovos presentes.
 - Ao guardar (store) uma construção Habitat, arquiva dragões que estavam naquele habitat.
-- Usa FloatingBase para registrar modelos flutuantes.
+- Ao guardar Incubator, remove visuais dos ovos.
 --]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -14,6 +15,8 @@ local Data = require(script.Parent.DataService)
 local PlotService = require(script.Parent.PlotService)
 local HabitatManager = require(script.Parent.Parent.Modules.HabitatManager)
 local FloatingBase = require(script.Parent.Parent.Modules.FloatingBase)
+local okIncViz, IncubatorVisualizer = pcall(require, script.Parent.Parent.Modules.IncubatorVisualizer)
+if not okIncViz then IncubatorVisualizer = nil end
 
 local BuildingService = {}
 BuildingService.Handlers = {}
@@ -169,6 +172,11 @@ BuildingService.Handlers.StoreBuilding = function(player, buildingId)
         end
     end
 
+    -- If Incubator, unregister visuals
+    if buildingData.Type == "Incubator" and IncubatorVisualizer then
+        pcall(function() IncubatorVisualizer.UnregisterIncubator(buildingId) end)
+    end
+
     -- Move para inventário
     profile.Buildings.Placed[buildingId] = nil
     buildingData.Position = nil
@@ -251,12 +259,21 @@ function BuildingService.InstantiateBuilding(player, buildingData)
 
     -- Se Habitat: registrar flutuação e tornar maior visualmente
     if buildingData.Type == "Habitat" then
-        -- aumentar visual sem alterar colisão (escala do Mesh eventualmente)
         pcall(function()
-            -- tentativa simples: aumentar PrimaryPart Y offset to appear larger
-            local f = model.PrimaryPart
-            -- registrar para flutuar
             FloatingBase.Register(model, 3, 0.9)
+        end)
+    end
+
+    -- If Incubator: register visualizer and spawn existing eggs for the owner
+    if buildingData.Type == "Incubator" and IncubatorVisualizer then
+        pcall(function()
+            IncubatorVisualizer.RegisterIncubator(model, player, buildingData.Id)
+            local profile = Data.Get(player)
+            if profile and profile.Eggs then
+                for _, egg in ipairs(profile.Eggs) do
+                    pcall(function() IncubatorVisualizer.SpawnEgg(player, egg) end)
+                end
+            end
         end)
     end
 
