@@ -1,7 +1,7 @@
---[[]]
+--[[
 HabitatManager - Funções helper para gerenciar habitats e dragões
 Enhancements: reatribuição de dragões arquivados quando um habitat é colocado.
---]]
+]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Config = require(ReplicatedStorage.Shared.Config)
@@ -105,7 +105,9 @@ function HabitatManager.ReassignArchivedDragons(profile, habitatId, player)
 
             -- spawn model if player provided
             if player then
-                local ok, DragonSpawner = pcall(require, script.Parent:FindFirstChild("DragonSpawner"))
+                local ok, DragonSpawner = pcall(function()
+                    return require(script.Parent:FindFirstChild("DragonSpawner"))
+                end)
                 if ok and DragonSpawner then
                     pcall(function() DragonSpawner.SpawnDragon(player, dragon, profile) end)
                 end
